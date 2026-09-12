@@ -13,7 +13,7 @@ import psutil
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -85,6 +85,11 @@ class EnvStates(StatesGroup):
 class EditStates(StatesGroup):
     waiting_range = State()
     waiting_content = State()
+    confirm = State()
+
+
+class GotoStates(StatesGroup):
+    waiting_line = State()
 
 
 # ============================================================
@@ -341,10 +346,26 @@ def file_view_keyboard(name: str, idx: int, page: int, total_pages: int):
     rows = [nav] if nav else []
     rows.append([
         InlineKeyboardButton(text="✏️ Edit lines", callback_data=f"editlines:{name}:{idx}"),
-        InlineKeyboardButton(text="⬇️ Download file", callback_data=f"dlfile:{name}:{idx}"),
+        InlineKeyboardButton(text="🔎 Go to line", callback_data=f"goto:{name}:{idx}"),
     ])
-    rows.append([InlineKeyboardButton(text="⬅️  Files", callback_data=f"files:{name}")])
+    rows.append([
+        InlineKeyboardButton(text="⬇️ Download file", callback_data=f"dlfile:{name}:{idx}"),
+        InlineKeyboardButton(text="⬅️  Files", callback_data=f"files:{name}"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def cancel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="fsmcancel")],
+    ])
+
+
+def confirm_edit_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Save", callback_data="confirmedit"),
+         InlineKeyboardButton(text="❌ Cancel", callback_data="fsmcancel")],
+    ])
 
 
 def env_menu_keyboard(name: str):
@@ -839,30 +860,16 @@ async def files_cb(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("vfile:"))
-async def view_file_cb(callback: CallbackQuery):
-    if not allowed(callback.from_user.id):
-        return await access_denied_cb(callback)
-
-    _, name, idx_raw, page_raw = callback.data.split(":", 3)
-    idx = int(idx_raw)
-    page = int(page_raw)
-    user_id = callback.from_user.id
-
+def render_file_page(user_id: int, name: str, idx: int, page: int):
+    """Returns (text, keyboard) for a given file/page, or (None, None) if not found."""
     files = list_project_files(user_id, name)
     if idx >= len(files):
-        await callback.answer("File not found.", show_alert=True)
-        return
+        return None, None
 
     rel_path = files[idx]
     full_path = project_dir(user_id, name) / rel_path
 
-    try:
-        raw_lines = full_path.read_text(errors="replace").splitlines()
-    except Exception as exc:
-        await callback.answer(f"Can't read file: {exc}", show_alert=True)
-        return
-
+    raw_lines = full_path.read_text(errors="replace").splitlines()
     if rel_path == ".env":
         raw_lines = [mask_env_line(l) for l in raw_lines]
 
@@ -873,16 +880,82 @@ async def view_file_cb(callback: CallbackQuery):
         f"sed -n '{start + 1},{start + len(chunk)}p' {rel_path}",
         numbered or "(empty file)",
     )
+    return text, file_view_keyboard(name, idx, page, total_pages)
+
+
+@dp.callback_query(F.data.startswith("vfile:"))
+async def view_file_cb(callback: CallbackQuery):
+    if not allowed(callback.from_user.id):
+        return await access_denied_cb(callback)
+
+    _, name, idx_raw, page_raw = callback.data.split(":", 3)
+    idx = int(idx_raw)
+    page = int(page_raw)
+    user_id = callback.from_user.id
 
     try:
-        await callback.message.edit_text(
-            text,
-            reply_markup=file_view_keyboard(name, idx, page, total_pages),
-            parse_mode="HTML",
-        )
+        text, kb = render_file_page(user_id, name, idx, page)
+    except Exception as exc:
+        await callback.answer(f"Can't read file: {exc}", show_alert=True)
+        return
+
+    if text is None:
+        await callback.answer("File not found.", show_alert=True)
+        return
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
         pass
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("goto:"))
+async def goto_line_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not allowed(callback.from_user.id):
+        return await access_denied_cb(callback)
+
+    _, name, idx_raw = callback.data.split(":", 2)
+    await state.update_data(project=name, idx=int(idx_raw))
+    await state.set_state(GotoStates.waiting_line)
+
+    await callback.message.answer(
+        "🔎 Send a line number to jump straight to it.",
+        reply_markup=cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.message(GotoStates.waiting_line)
+async def goto_line_msg(message: Message, state: FSMContext):
+    if not allowed(message.from_user.id):
+        return await access_denied(message)
+
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("Send a plain line number, e.g. <code>42</code>.", parse_mode="HTML", reply_markup=cancel_keyboard())
+        return
+
+    data = await state.get_data()
+    name = data["project"]
+    idx = data["idx"]
+    user_id = message.from_user.id
+    line_number = int(text)
+    page = max(0, (line_number - 1) // PAGE_SIZE)
+
+    await state.clear()
+
+    try:
+        view_text, kb = render_file_page(user_id, name, idx, page)
+    except Exception as exc:
+        await message.answer(f"Can't read file: {exc}")
+        return
+
+    if view_text is None:
+        await message.answer("File not found.")
+        return
+
+    await message.answer(view_text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("dlfile:"))
@@ -965,6 +1038,7 @@ async def edit_lines_start_cb(callback: CallbackQuery, state: FSMContext):
         "Send the line range to replace, e.g. <code>10-15</code> "
         "(or a single line like <code>7</code>).",
         parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
     )
     await callback.answer()
 
@@ -978,23 +1052,41 @@ async def edit_lines_range_msg(message: Message, state: FSMContext):
     match = re.fullmatch(r"(\d+)(?:-(\d+))?", text)
 
     if not match:
-        await message.answer("Format not recognised. Send like <code>10-15</code> or <code>7</code>.", parse_mode="HTML")
+        await message.answer(
+            "Format not recognised. Send like <code>10-15</code> or <code>7</code>.",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard(),
+        )
         return
 
     start_line = int(match.group(1))
     end_line = int(match.group(2)) if match.group(2) else start_line
 
-    if start_line < 1 or end_line < start_line:
-        await message.answer("Invalid range.")
+    data = await state.get_data()
+    name = data["project"]
+    rel_path = data["rel_path"]
+    user_id = message.from_user.id
+    full_path = project_dir(user_id, name) / rel_path
+    lines = full_path.read_text(errors="replace").splitlines()
+
+    if start_line < 1 or end_line < start_line or start_line > len(lines):
+        await message.answer("Invalid range for this file.", reply_markup=cancel_keyboard())
         return
+
+    end_line = min(end_line, len(lines))
+    current = lines[start_line - 1:end_line]
+    numbered_current = "\n".join(f"{start_line + i:>4} │ {l}" for i, l in enumerate(current))
 
     await state.update_data(start_line=start_line, end_line=end_line)
     await state.set_state(EditStates.waiting_content)
 
     await message.answer(
-        f"Now send the replacement content for lines <code>{start_line}-{end_line}</code>.\n"
-        "Send <code>/blank</code> to delete those lines instead.",
+        "📄 <b>Current content</b>\n\n"
+        + terminal_block(f"sed -n '{start_line},{end_line}p' {rel_path}", numbered_current)
+        + "\n\nSend the replacement text for these lines. "
+        "Send <code>/blank</code> to delete them instead.",
         parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
     )
 
 
@@ -1016,20 +1108,65 @@ async def edit_lines_content_msg(message: Message, state: FSMContext):
     new_content = "" if message.text.strip() == "/blank" else message.text
     new_lines = new_content.split("\n") if new_content else []
 
-    if end_line > len(lines):
-        end_line = len(lines)
+    old_slice = lines[start_line - 1:min(end_line, len(lines))]
+
+    diff_body = "\n".join(f"- {l}" for l in old_slice)
+    if new_lines:
+        diff_body += "\n" + "\n".join(f"+ {l}" for l in new_lines)
+    else:
+        diff_body += "\n+ (lines removed)"
+
+    await state.update_data(new_lines=new_lines)
+    await state.set_state(EditStates.confirm)
+
+    await message.answer(
+        f"📄 <b>Preview</b> — <code>{html_escape(rel_path)}</code>, lines {start_line}-{end_line}\n\n"
+        + terminal_block(f"diff {rel_path}.orig {rel_path}", diff_body)
+        + "\n\nSave this change?",
+        parse_mode="HTML",
+        reply_markup=confirm_edit_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "confirmedit", StateFilter(EditStates.confirm))
+async def confirm_edit_cb(callback: CallbackQuery, state: FSMContext):
+    if not allowed(callback.from_user.id):
+        return await access_denied_cb(callback)
+
+    data = await state.get_data()
+    name = data["project"]
+    rel_path = data["rel_path"]
+    start_line = data["start_line"]
+    end_line = data["end_line"]
+    new_lines = data["new_lines"]
+    user_id = callback.from_user.id
+
+    full_path = project_dir(user_id, name) / rel_path
+    lines = full_path.read_text(errors="replace").splitlines()
+    end_line = min(end_line, len(lines))
 
     updated = lines[:start_line - 1] + new_lines + lines[end_line:]
     full_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
     await state.clear()
 
-    await message.answer(
-        f"✅ Updated <code>{html_escape(rel_path)}</code>, lines "
-        f"{start_line}-{end_line} → {len(new_lines)} new line(s).\n\n"
+    await callback.message.edit_text(
+        f"✅ Saved — <code>{html_escape(rel_path)}</code>, lines {start_line}-{end_line} "
+        f"→ {len(new_lines)} new line(s).\n\n"
         "Restart the project for changes to take effect.",
         parse_mode="HTML",
     )
+    await callback.answer("Saved")
+
+
+@dp.callback_query(F.data == "fsmcancel")
+async def fsm_cancel_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ Cancelled.")
+    except TelegramBadRequest:
+        await callback.message.answer("❌ Cancelled.")
+    await callback.answer()
 
 
 # ============================================================
@@ -1063,6 +1200,7 @@ async def env_new_cb(callback: CallbackQuery, state: FSMContext):
         "e.g.:\n<pre>BOT_TOKEN=123:abc\nADMIN_ID=123456789</pre>\n"
         "This replaces the file directly — no upload needed.",
         parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
     )
     await callback.answer()
 
